@@ -8,7 +8,6 @@
 const MONTHS = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
 const ESCAPES = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
 const ESC_RE = /[&<>"']/g;
-const ESC_TEST = /[&<>"']/;
 const RESERVED = ['posts', 'tags', 'page'];
 
 /** Per-case caches (fresh Maps per run(): nothing is carried across cases). */
@@ -16,7 +15,7 @@ let slugCache;
 let dateCache;
 
 function escapeHtml(text) {
-  return ESC_TEST.test(text) ? text.replace(ESC_RE, (c) => ESCAPES[c]) : text;
+  return text.replace(ESC_RE, (c) => ESCAPES[c]);
 }
 
 const NON_ASCII_RE = /[^\x00-\x7F]/;
@@ -82,7 +81,8 @@ const WS_TABLE = (() => {
 
 function wordsOf(text) {
   // Runs of non-whitespace, counted without allocating the match array:
-  // whitespace is exactly JS \s (White_Space + line terminators).
+  // whitespace is exactly JS \s (White_Space + line terminators). One pass
+  // over the whole body beats per-line counting (call overhead per line).
   let count = 0;
   let inWord = false;
   for (let i = 0; i < text.length; i++) {
@@ -382,28 +382,24 @@ function findSingleStar(s, from) {
 
 const WS_RE = /\s/;
 
-function nextSpecial(s, from) {
-  let j = s.length;
-  let k = s.indexOf('\\', from);
-  if (k !== -1 && k < j) j = k;
-  k = s.indexOf('`', from);
-  if (k !== -1 && k < j) j = k;
-  k = s.indexOf('*', from);
-  if (k !== -1 && k < j) j = k;
-  k = s.indexOf('[', from);
-  if (k !== -1 && k < j) j = k;
-  return j === s.length ? -1 : j;
-}
+// The four inline specials, found with one native scan. Shared across the
+// recursive inline() calls: each call saves and restores lastIndex, and sets
+// it explicitly before every exec, so re-entrancy is safe.
+const NEXT_RE = /\\|`|\*|\[/g;
 
 /** Inline rendering, exactly the reference's, with plain runs escaped in bulk. */
 function inline(s, link) {
+  const saved = NEXT_RE.lastIndex;
+  NEXT_RE.lastIndex = 0;
   const out = [];
   let i = 0;
   let plainStart = 0;
   const len = s.length;
   while (true) {
-    const j = nextSpecial(s, i);
-    if (j === -1) break;
+    NEXT_RE.lastIndex = i;
+    const mt = NEXT_RE.exec(s);
+    if (mt === null) break;
+    const j = mt.index;
     const c = s.charCodeAt(j);
     if (c === 92 && j + 1 < len && isEscapableCode(s.charCodeAt(j + 1))) {
       if (j > plainStart) out.push(escapeHtml(s.slice(plainStart, j)));
@@ -457,6 +453,7 @@ function inline(s, link) {
     i = j + 1;
   }
   if (len > plainStart) out.push(escapeHtml(s.slice(plainStart, len)));
+  NEXT_RE.lastIndex = saved;
   return out.join('');
 }
 
@@ -726,6 +723,29 @@ function expandNodes(nodes, depth, templates, budget) {
   return out;
 }
 
+const CLEAN_ROOTS = new Set(['site', 'tags', 'recent']);
+
+function isCleanNodes(nodes, clean) {
+  for (const n of nodes) {
+    if (n.k === 0) continue;
+    if (n.k === 1 || n.k === 2) {
+      if (!clean.has(n.path[0])) return false;
+    } else if (n.k === 3) {
+      if (!clean.has(n.path[0])) return false;
+      if (!isCleanNodes(n.then, clean)) return false;
+      if (n.els !== null && !isCleanNodes(n.els, clean)) return false;
+    } else if (n.k === 4) {
+      const next = new Set(clean);
+      if (clean.has(n.path[0])) { next.add(n.name); next.add('loop'); }
+      else { next.delete(n.name); next.delete('loop'); }
+      if (!isCleanNodes(n.body, next)) return false;
+    } else {
+      return false;
+    }
+  }
+  return true;
+}
+
 function renderNodes(nodes, scope, ctx, depth, out) {
   for (let ni = 0; ni < nodes.length; ni++) {
     const n = nodes[ni];
@@ -770,6 +790,18 @@ function renderNodes(nodes, scope, ctx, depth, out) {
         if (ex === undefined) {
           ex = expandNodes(t, depth + 1, ctx.templates, { n: 0 });
           ctx.expanded.set(key, ex);
+        }
+        if (ex !== null && !ctx.frozen.has(key)) {
+          // First use of this expansion: if it reads only case-constant
+          // data, render it once against the case scope and freeze it as a
+          // single text node, shared by every page of the case.
+          ctx.frozen.add(key);
+          if (isCleanNodes(ex, CLEAN_ROOTS)) {
+            const tmp = [];
+            renderNodes(ex, ctx.caseScope, ctx, depth + 1, tmp);
+            ex = [{ k: 0, text: tmp.join('') }];
+            ctx.expanded.set(key, ex);
+          }
         }
         renderNodes(ex === null ? t : ex, scope, ctx, depth + 1, out);
         break;
@@ -968,7 +1000,7 @@ export function run(input) {
   const site = { title: input.site.title, base_url: base };
   const allTags = tags.map((t) => ({ name: t.name, slug: t.slug, url: t.url, count: t.posts.length }));
   const recent = posts.slice(0, input.site.recent).map((p) => cards.get(p));
-  const ctx = { templates, expanded: new Map(), escape: escapeHtml };
+  const ctx = { templates, expanded: new Map(), frozen: new Set(), caseScope: { vars: { site, tags: allTags, recent }, parent: null }, escape: escapeHtml };
   const output = {};
   const render = (name, vars) => {
     const nodes = templates.get(name);
