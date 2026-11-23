@@ -19,33 +19,19 @@ function escapeHtml(text) {
   return ESC_TEST.test(text) ? text.replace(ESC_RE, (c) => ESCAPES[c]) : text;
 }
 
+const NON_ASCII_RE = /[^\x00-\x7F]/;
+const NON_SLUG_RE = /[^a-z0-9]+/g;
+const LEAD_DASH_RE = /^-+/;
+const TRAIL_DASH_RE = /-+$/;
+
 function slugify(text) {
   const hit = slugCache.get(text);
   if (hit !== undefined) return hit;
   let out;
-  let ascii = true;
-  for (let i = 0; i < text.length; i++) {
-    if (text.charCodeAt(i) > 127) { ascii = false; break; }
-  }
-  if (ascii) {
+  if (!NON_ASCII_RE.test(text)) {
     // ASCII is stable under NFKD and holds no combining marks, so the
-    // reference loop over the NFKD form is this loop over the text itself.
-    out = '';
-    let gap = false;
-    for (let i = 0; i < text.length; i++) {
-      const c = text.charCodeAt(i);
-      let keep = -1;
-      if (c >= 65 && c <= 90) keep = c + 32;
-      else if ((c >= 97 && c <= 122) || (c >= 48 && c <= 57)) keep = c;
-      if (keep === -1) { gap = out.length > 0; continue; }
-      if (gap) out += '-';
-      gap = false;
-      out += String.fromCharCode(keep);
-    }
-    if (out.length > 64) out = out.slice(0, 64);
-    let e = out.length;
-    while (e > 0 && out.charCodeAt(e - 1) === 45) e--;
-    if (e !== out.length) out = out.slice(0, e);
+    // reference loop over the NFKD form is these native passes over the text.
+    out = text.toLowerCase().replace(NON_SLUG_RE, '-').replace(LEAD_DASH_RE, '').slice(0, 64).replace(TRAIL_DASH_RE, '');
     if (out === '') out = 'untitled';
   } else {
     const plain = text.normalize('NFKD').replace(/\p{M}/gu, '');
@@ -264,6 +250,29 @@ function isBlank(line) {
   return isBlankLine(line);
 }
 
+/**
+ * Whether a line ends a paragraph: blank, a fence opener, a heading, or a
+ * rule. One fused scan: all four tests key off the line's first characters
+ * (blank lines aside, each needs its marker at column 0), so a line starting
+ * with whitespace is blank-or-text, and any other line is decided by its
+ * first character.
+ */
+function breaksParagraph(line) {
+  if (line.length === 0) return true;
+  const c0 = line.charCodeAt(0);
+  if (c0 === 32 || c0 === 9) {
+    for (let i = 1; i < line.length; i++) {
+      const c = line.charCodeAt(i);
+      if (c !== 32 && c !== 9) return false;
+    }
+    return true;
+  }
+  if (c0 === 96) return fenceOpen(line) !== null;
+  if (c0 === 35) return headingOf(line) !== null;
+  if (c0 === 45 || c0 === 42) return isHR(line);
+  return false;
+}
+
 /** Fence opener's language, or null. */
 function fenceOpen(line) {
   if (line.charCodeAt(0) !== 96 || line.charCodeAt(1) !== 96 || line.charCodeAt(2) !== 96) return null;
@@ -314,10 +323,6 @@ function isHR(line) {
   return true;
 }
 
-function endsParagraph(line) {
-  return isBlank(line) || fenceOpen(line) !== null || headingOf(line) !== null || isHR(line);
-}
-
 /** { ordered, start, text } or null. */
 function listMarker(line) {
   const c0 = line.charCodeAt(0);
@@ -345,6 +350,10 @@ function isEscapableCode(c) {
 }
 
 function findUnescaped(s, what, from) {
+  const k = s.indexOf(what, from);
+  if (k === -1) return -1;
+  const bs = s.indexOf('\\', from);
+  if (bs === -1 || bs >= k) return k;
   for (let j = from; j <= s.length - what.length; j++) {
     if (s.charCodeAt(j) === 92 && j + 1 < s.length && isEscapableCode(s.charCodeAt(j + 1))) { j++; continue; }
     if (s.startsWith(what, j)) return j;
@@ -353,7 +362,15 @@ function findUnescaped(s, what, from) {
 }
 
 function findSingleStar(s, from) {
-  for (let j = from; j < s.length; j++) {
+  const bs = s.indexOf('\\', from);
+  const end = bs === -1 ? s.length : bs;
+  let k = s.indexOf('*', from);
+  while (k !== -1 && k < end) {
+    if (s.charCodeAt(k + 1) === 42) { k = s.indexOf('*', k + 2); continue; }
+    return k;
+  }
+  if (bs === -1) return -1;
+  for (let j = bs; j < s.length; j++) {
     const c = s.charCodeAt(j);
     if (c === 92 && j + 1 < s.length && isEscapableCode(s.charCodeAt(j + 1))) { j++; continue; }
     if (c !== 42) continue;
@@ -455,9 +472,14 @@ function renderMarkdown(src, link) {
   let i = 0;
   while (i < n) {
     const line = lines[i];
-    if (isBlank(line)) { i++; continue; }
-    const lang = fenceOpen(line);
-    if (lang !== null) {
+    if (line.length === 0) { i++; continue; }
+    const c0 = line.charCodeAt(0);
+    let mk = null;
+    if (c0 === 32 || c0 === 9) {
+      if (isBlankLine(line)) { i++; continue; }
+    } else if (c0 === 96) {
+      const lang = fenceOpen(line);
+      if (lang !== null) {
       i++;
       const parts = [lang === '' ? '<pre><code>' : `<pre><code class="language-${escapeHtml(lang)}">`];
       while (i < n && !isFenceClose(lines[i])) { parts.push(escapeHtml(lines[i]), '\n'); i++; }
@@ -465,18 +487,21 @@ function renderMarkdown(src, link) {
       parts.push('</code></pre>');
       blocks.push(parts.join(''));
       continue;
-    }
-    const hd = headingOf(line);
-    if (hd !== null) {
+      }
+    } else if (c0 === 35) {
+      const hd = headingOf(line);
+      if (hd !== null) {
       const id = uniqueSlug(slugify(hd[1]), ids);
       const html = inline(hd[1], link);
       blocks.push(`<h${hd[0]} id="${id}">${html}</h${hd[0]}>`);
       if (hd[0] === 2 || hd[0] === 3) toc.push({ level: hd[0], id, html });
       i++;
       continue;
-    }
-    if (isHR(line)) { blocks.push('<hr>'); i++; continue; }
-    if (line.charCodeAt(0) === 62) {
+      }
+    } else if (c0 === 45 || c0 === 42) {
+      if (isHR(line)) { blocks.push('<hr>'); i++; continue; }
+      mk = listMarker(line);
+    } else if (c0 === 62) {
       const kept = [];
       while (i < n && lines[i].charCodeAt(0) === 62) {
         const l = lines[i];
@@ -487,8 +512,9 @@ function renderMarkdown(src, link) {
       }
       blocks.push(kept.length === 0 ? '<blockquote>\n</blockquote>' : `<blockquote>\n<p>${inline(kept.join('\n'), link)}</p>\n</blockquote>`);
       continue;
+    } else if (c0 >= 48 && c0 <= 57) {
+      mk = listMarker(line);
     }
-    const mk = listMarker(line);
     if (mk !== null) {
       const items = [[trimLine(mk.text)]];
       i++;
@@ -512,7 +538,7 @@ function renderMarkdown(src, link) {
     }
     const body = [trimLine(line)];
     i++;
-    while (i < n && !endsParagraph(lines[i])) { body.push(trimLine(lines[i])); i++; }
+    while (i < n && !breaksParagraph(lines[i])) { body.push(trimLine(lines[i])); i++; }
     const html = inline(body.join('\n'), link);
     if (!hasExcerpt) { excerpt = html; hasExcerpt = true; }
     blocks.push(`<p>${html}</p>`);
@@ -651,6 +677,55 @@ function truthy(v) {
   return v !== undefined && v !== null && v !== false && v !== '' && v !== 0;
 }
 
+const EXPAND_BUDGET = 2048;
+
+/**
+ * A template's nodes with its includes spliced in, as the renderer would see
+ * them at include-depth `depth` (an include renders iff its depth is under
+ * INCLUDE_DEPTH, at depth+1). Returns null when the expansion would exceed
+ * the budget (include cycles with wide branching); the caller then renders
+ * the template dynamically, which is always correct. Never mutates the
+ * parsed trees: shared nodes are reused read-only, merged text is fresh.
+ */
+function expandNodes(nodes, depth, templates, budget) {
+  const out = [];
+  for (let ni = 0; ni < nodes.length; ni++) {
+    const n = nodes[ni];
+    if (n.k === 5) {
+      if (depth >= INCLUDE_DEPTH) continue;
+      const t = templates.get(n.name);
+      if (t === undefined) continue;
+      const sub = expandNodes(t, depth + 1, templates, budget);
+      if (sub === null) return null;
+      for (let si = 0; si < sub.length; si++) {
+        const m = sub[si];
+        if (m.k === 0 && out.length > 0 && out[out.length - 1].k === 0) {
+          const prev = out[out.length - 1];
+          out[out.length - 1] = { k: 0, text: prev.text + m.text };
+        } else out.push(m);
+        if (++budget.n > EXPAND_BUDGET) return null;
+      }
+      continue;
+    }
+    if (n.k === 3) {
+      const then = expandNodes(n.then, depth, templates, budget);
+      if (then === null) return null;
+      let els = null;
+      if (n.els !== null) {
+        els = expandNodes(n.els, depth, templates, budget);
+        if (els === null) return null;
+      }
+      out.push({ k: 3, not: n.not, path: n.path, then, els });
+    } else if (n.k === 4) {
+      const body = expandNodes(n.body, depth, templates, budget);
+      if (body === null) return null;
+      out.push({ k: 4, name: n.name, path: n.path, body });
+    } else out.push(n);
+    if (++budget.n > EXPAND_BUDGET) return null;
+  }
+  return out;
+}
+
 function renderNodes(nodes, scope, ctx, depth, out) {
   for (let ni = 0; ni < nodes.length; ni++) {
     const n = nodes[ni];
@@ -676,9 +751,9 @@ function renderNodes(nodes, scope, ctx, depth, out) {
         const len = xs.length;
         const loop = { index: 1, first: true, last: len === 1, length: len };
         const frame = { vars: {}, parent: scope };
+        frame.vars.loop = loop;
         for (let k = 0; k < len; k++) {
           frame.vars[n.name] = xs[k];
-          frame.vars.loop = loop;
           loop.index = k + 1;
           loop.first = k === 0;
           loop.last = k === len - 1;
@@ -687,8 +762,16 @@ function renderNodes(nodes, scope, ctx, depth, out) {
         break;
       }
       case 5: {
+        if (depth >= INCLUDE_DEPTH) break;
         const t = ctx.templates.get(n.name);
-        if (t !== undefined && depth < INCLUDE_DEPTH) renderNodes(t, scope, ctx, depth + 1, out);
+        if (t === undefined) break;
+        const key = `${n.name}#${depth}`;
+        let ex = ctx.expanded.get(key);
+        if (ex === undefined) {
+          ex = expandNodes(t, depth + 1, ctx.templates, { n: 0 });
+          ctx.expanded.set(key, ex);
+        }
+        renderNodes(ex === null ? t : ex, scope, ctx, depth + 1, out);
         break;
       }
     }
@@ -855,9 +938,13 @@ export function run(input) {
 
   // 7. Layouts.
   for (const s of kept) s.rm = Math.max(1, Math.ceil(wordsOf(s.body) / 200));
+  const linkOf = (s) => (s === null ? null : { title: s.data.title, url: s.url, date: s.data.date ?? '', date_long: s.data.date === undefined ? '' : longDate(s.data.date) });
   const cardFor = (s) => {
     let c = s.card;
     if (c !== undefined) return c;
+    // One object per source serves as both its card (in lists) and its page
+    // (as the layout's scope): templates only read named fields, and the
+    // extra fields are invisible to list templates.
     c = {
       title: s.data.title,
       url: s.url,
@@ -867,6 +954,12 @@ export function run(input) {
       excerpt: s.excerpt,
       reading_minutes: s.rm,
       tags: s.tagRefs.map((t) => ({ name: t.name, slug: t.slug, url: t.url })),
+      slug: s.slug,
+      content: s.html,
+      toc: s.toc.map((h) => ({ level: h.level, id: h.id, html: h.html })),
+      newer: linkOf(s.newer ?? null),
+      older: linkOf(s.older ?? null),
+      is_post: s.post,
     };
     s.card = c;
     return c;
@@ -875,7 +968,7 @@ export function run(input) {
   const site = { title: input.site.title, base_url: base };
   const allTags = tags.map((t) => ({ name: t.name, slug: t.slug, url: t.url, count: t.posts.length }));
   const recent = posts.slice(0, input.site.recent).map((p) => cards.get(p));
-  const ctx = { templates, escape: escapeHtml };
+  const ctx = { templates, expanded: new Map(), escape: escapeHtml };
   const output = {};
   const render = (name, vars) => {
     const nodes = templates.get(name);
@@ -884,18 +977,8 @@ export function run(input) {
     renderNodes(nodes, { vars: { site, tags: allTags, recent, ...vars }, parent: null }, ctx, 0, out);
     return out.join('');
   };
-  const linkOf = (s) => (s === null ? null : { title: s.data.title, url: s.url, date: s.data.date ?? '', date_long: s.data.date === undefined ? '' : longDate(s.data.date) });
   for (const s of kept) {
-    const page = {
-      ...cardFor(s),
-      slug: s.slug,
-      content: s.html,
-      toc: s.toc.map((h) => ({ level: h.level, id: h.id, html: h.html })),
-      newer: linkOf(s.newer ?? null),
-      older: linkOf(s.older ?? null),
-      is_post: s.post,
-    };
-    output[`${s.outDir}/index.html`] = render(s.layout, { page });
+    output[`${s.outDir}/index.html`] = render(s.layout, { page: cardFor(s) });
   }
   const per = input.site.per_page;
   const pages = Math.max(1, Math.ceil(posts.length / per));
